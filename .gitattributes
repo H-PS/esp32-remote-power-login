@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+# Arduino / C++
+*.ino text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+
+# Docs
+*.md text eol=lf
+*.example text eol=lf
+*.scad text eol=lf
+
+# Binary
+*.png binary
+*.jpg binary
+*.pdf binary
+*.stl binary

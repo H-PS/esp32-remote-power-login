@@ -1,0 +1,27 @@
+# Secrets & personal config — never commit these
+secrets.h
+config_local.h
+
+# Arduino / build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+.arduino/
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local backups (keep the folder, ignore the contents if you prefer)
+# backup/
