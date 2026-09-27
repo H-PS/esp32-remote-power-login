@@ -7,6 +7,8 @@
 [![Cost](https://img.shields.io/badge/BOM-%C2%A528-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
+**Languages**: **English** ｜ [简体中文](README.zh-CN.md)
+
 ---
 
 ## The Problem
@@ -273,7 +275,8 @@ We implement WoL as a bonus (for sleep states), but the servo is the reliable pa
 ```
 .
 ├── wifi_pin_login.ino      # Main firmware
-├── README.md               # This file
+├── README.md               # This file (English)
+├── README.zh-CN.md         # 简体中文说明
 ├── TECH_SUMMARY.md         # Deep-dive: architecture, protocol notes, lessons learned
 ├── secrets.h.example       # Credentials template → copy to secrets.h (gitignored)
 ├── power_bridge.scad       # Parametric 3D-printable servo mount (OpenSCAD)
