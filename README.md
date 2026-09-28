@@ -93,6 +93,45 @@ ESP "OTG" port ──USB-C data cable──▶ Laptop USB port   (keyboard signa
 - The servo can draw ~800 mA when pressing — a 5V/2A supply has headroom
 - Two USB ports on the board are for power + data separately; no conflict if both are plugged in
 
+### ⚠️ The `5Vin` header pin is NOT live by default
+
+On boards like the **YD-ESP32-S3**, the `5Vin` header pin is **not connected to the board's 5V rail out of the box**. Two paths run in parallel from that pin to the 5V net:
+
+```
+5Vin ──┬──[ D3 diode    ]──▶ 5V    one-way (external → board), ~0.3V drop   ← fitted by default
+       └──[ 0Ω resistor ]──▶ 5V    bidirectional, no drop  (marked "IN-OUT") ← NOT fitted by default
+```
+
+So by default `5Vin` can only be an **input** (feed the board from an external supply). To *source* 5V from it you must bridge the 0Ω `IN-OUT` pad.
+
+**The vendor's own documentation states:**
+
+> The 5V-IN pin does not supply power by default, because drawing power directly from the core board affects the stability of the ESP32. This design protects the board and keeps it running reliably. If you need 5V output, you can bridge the pad to output 5V.
+
+**Bridging works — but do NOT power a servo from it.**
+
+A servo is a bursty load: 10–50 mA idle, 200–300 mA moving, **700 mA–1 A stalled**. After bridging, that current has to travel
+
+```
+charger → USB cable → D1 diode → board 5V net → 5Vin → servo
+```
+
+Every element on that path adds resistance (cable, connector, **D1's 0.3–0.5 V drop**, thin PCB copper). By `ΔV = I × R`, a stalled servo drags the board's 5V rail down → the ESP32-S3's 3.3V LDO falls below dropout → **brownout reset**.
+
+The nasty part is *when* it resets. If the ESP resets **inside** the 600 ms button-press window, the servo loses PWM mid-press and freezes on the power button — and the ESP needs 3–5 s to reboot and home it. That is exactly the window that triggers a **forced power-off** on most laptops. You asked it to turn the machine on; you turned it off instead.
+
+**→ Give the servo its own 5V supply:**
+
+| Servo wire | Connect to |
+|---|---|
+| Orange (signal) | `GPIO14` |
+| Red (power) | **External 5V +** — straight from the charger, *not* the board |
+| Brown (ground) | Board `GND`, **and** external 5V − must also reach board `GND` (a common ground is mandatory) |
+
+Bridging `IN-OUT` is still perfectly fine for **small loads** (OLED, sensors, <100 mA).
+
+Serve yourself from a spare USB cable (red = 5V, black = GND) or a ¥3 USB-A-to-screw-terminal adapter.
+
 ### Mounting the servo (cam method)
 
 1. Mount the servo body **directly above** the power button, disc edge aligned with the key
@@ -210,7 +249,7 @@ Both the **topic name** and its **nickname** must be written as your final inten
 | Scenario | Use | Why |
 |---|---|---|
 | **Locked** (`Win+L`, most common) | `login1` | PIN field is already focused — fastest and safest, touches nothing else |
-| **Black / sleeping screen** | `login` | Needs ESC to wake the display and Enter to focus the field |
+| **Display is off** (system still running) | `login` | Needs ESC to wake the display, then Enter to focus the field |
 | **Unlocked, focus in browser** | `login1` or set `LOGIN_SEND_PREAMBLE 0` | ⚠️ ESC/Enter would misbehave here |
 
 > **Rule of thumb:** if unsure, send `login1`. It does exactly one thing — type the PIN and press Enter — and can't do any harm.
@@ -260,13 +299,44 @@ Many campus portals kick idle clients. The firmware auto-reconnects every 10 sec
 
 ## Why not Wake-on-LAN?
 
+WoL magic packets are **Layer-2 broadcast frames** — no IP address, no authentication, no routing required. But that also makes the only requirement a hard one: **sender and receiver must sit in the same broadcast domain.**
+
 | Method | Works when off? | Reliability |
 |---|---|---|
-| Wi-Fi WoWLAN | ❌ | Only works in sleep states where the NIC stays powered |
-| Wired WoL | ✅ | Requires the NIC to be powered; many laptops have no Ethernet |
-| **Physical button press (this project)** | ✅ | **Works for any machine, zero configuration** |
+| Wi-Fi WoWLAN | ❌ | Only in sleep states where the NIC stays powered — many laptops cut Wi-Fi power in S3 |
+| Wired WoL | ⚠️ | Works, **but only when the ESP and the target share a broadcast domain** |
+| **Physical button press (this project)** | ✅ | **Any machine, zero config, immune to network topology** |
 
-We implement WoL as a bonus (for sleep states), but the servo is the reliable path.
+### The failure mode we actually hit
+
+```
+ESP on the campus Wi-Fi    →  subnet A   ┐
+                                         ├─ two different VLANs
+Laptop on a dorm Ethernet  →  subnet B   ┘
+```
+
+The limited broadcast `255.255.255.255` is **never forwarded by Layer-3 devices**, so the magic packet never arrives. **No network-adapter setting can fix this** — it is a topology problem, not a driver problem.
+
+> We verified every box on the PC side was ticked: `WakeOnMagicPacket = Enabled`, the adapter armed as a wake source (`powercfg /devicequery wake_armed`), fast startup disabled, both **wired and wireless** MACs sent, direct subnet broadcast *plus* unicast — all correct, all useless behind a VLAN boundary. Don't burn a weekend on it; check the topology first.
+
+> **Want WoL to actually work?** Put the ESP and the target machine behind **the same router**, so they share a `192.168.x.x` subnet. Then set `ENABLE_WOL` to `1`.
+
+### What we recommend instead: lock screen, not sleep
+
+The machine keeps running, the ESP keyboard stays online, and a single `login1` command logs you in — **no WoL, no servo, no extra hardware**:
+
+```powershell
+powercfg /change standby-timeout-ac 0     # never sleep on AC
+powercfg /change standby-timeout-dc 0     # never sleep on battery
+```
+
+Also set *Control Panel → Power Options → Choose what closing the lid does → Do nothing* (and mind the thermals if you close the lid).
+
+| State | ESP keyboard works? | Command |
+|---|---|---|
+| Display off (system running) | ✅ | `login` |
+| Locked (`Win+L`) | ✅ **sweet spot** | `login1` |
+| Sleep / hibernate | ❌ **avoid — the ESP cannot wake it** | — |
 
 ---
 

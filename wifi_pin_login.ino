@@ -1,9 +1,10 @@
 /*
- * WiFi PIN 登录器 —— ESP32-S3 版（v4.5：巴法云 MQTT + 纯网络 WOL 唤醒 + 纯舵机）
+ * WiFi PIN 登录器 —— ESP32-S3 版（v5.4：巴法云 MQTT + SG90 舵机按压电源键；WOL 可用开关控制）
+ *      - WOL 由 `ENABLE_WOL` 控制（本发布版设为 1）。仅在 ESP 与目标机处于同一广播域时才有意义
  * ==================================================================
  * 功能：
  *   1. 执行器物理按压笔记本电源键（远程开机，笔记本 WOL 不可靠时的正解）
- *      - SG90 舵机（凸轮/拨片装法），信号线接 GPIO4
+ *      - SG90 舵机（凸轮装法），信号线接 GPIO14（左排针底部，与 5Vin/GND 相邻）
  *   2. 等电脑开机后，以"USB 键盘"身份在 Windows 登录界面
  *      自动键入 PIN 并回车，完成登录
  *   3. 手机联动两条通道（可同时启用）：
@@ -25,9 +26,22 @@
  *   烧录时数据线插 "CH343P/USB转串口" 口；烧完把线换插 "OTG/直通" 口
  */
 
+/* ---- WOL 网络唤醒开关（必须在 #include 之前定义）----
+ * 1 = 启用：广播魔术包唤醒睡眠中的电脑。
+ *           ⚠️ 前提是「ESP 与目标机处于同一广播域」。跨网段时必然无效 ——
+ *           受限广播 255.255.255.255 不会被三层设备转发。典型反例：
+ *           校园网的无线段与宿舍有线段分属不同 VLAN，魔法包到不了。
+ *           想稳定使用，让 ESP 与目标机挂在同一台路由器下面。
+ * 0 = 关闭：不需要远程唤醒（例如用「锁屏代替睡眠」），此时 sendWol() 不参与
+ *           编译、login 不再空等 3 秒、WiFiUdp 不被引用，运行开销为零。
+ */
+#define ENABLE_WOL 1
+
 #include <WiFi.h>
 #include <WebServer.h>
+#if ENABLE_WOL
 #include <WiFiUdp.h>
+#endif
 #include <HTTPClient.h>
 #include "USBHIDKeyboard.h"
 
@@ -45,8 +59,8 @@
 #endif
 
 /* ================= 1. 必改配置 =================
- * 方式一（推荐，开源友好）：在同目录建 secrets.h（可从 secrets.h.example 复制），
- *   把你的真实配置写在里面 —— secrets.h 已被 .gitignore 排除，不会被提交。
+ * 方式一（推荐，开源友好）：在同目录建 secrets.h（从 secrets.h.example 复制），
+ *   把真实配置写在里面 —— secrets.h 已被 .gitignore 排除，不会被提交。
  * 方式二（简单）：直接在下面这几行改。
  */
 #if __has_include("secrets.h")
@@ -56,10 +70,10 @@
   const char* PIN_CODE   = SECRET_PIN_CODE;
   const char* PAGE_TOKEN = SECRET_PAGE_TOKEN;
 #else
-  const char* WIFI_SSID  = "YourWiFiName";     // ← 改成你的 WiFi
+  const char* WIFI_SSID  = "YourWiFiName";     // ← 改成你的 WiFi 名
   const char* WIFI_PASS  = "YourPassword";     // ← 开放网络留空 ""
   const char* PIN_CODE   = "123456";           // ← 改成你的 Windows PIN
-  const char* PAGE_TOKEN = "change_this";      // ← 改成你自己的口令
+  const char* PAGE_TOKEN = "change_this";      // ← 改成你自己的网页口令
 #endif
 
 /* ---- 巴法云（USE_CLOUD=1 时必改）----
@@ -78,28 +92,40 @@
  * 发送端：微信小程序"巴法云"（开关按钮）/ 网页控制台发送栏
  */
 #if __has_include("secrets.h")
-const char* BEMFA_UID = SECRET_BEMFA_UID;
-#else
-const char* BEMFA_UID = "your_private_key";   // ← 巴法云私钥
-#endif
-#if __has_include("secrets.h")
+const char* BEMFA_UID   = SECRET_BEMFA_UID;
 const char* BEMFA_TOPIC = SECRET_BEMFA_TOPIC;
 #else
-const char* BEMFA_TOPIC = "your_topic";  // ← MQTT设备云 里建的 MQTT 类型主题
+const char* BEMFA_UID   = "your_private_key";  // ← 巴法云私钥
+const char* BEMFA_TOPIC = "your_topic";        // ← MQTT设备云 里建的消息型主题
 #endif
 
-/* ---- WOL 网络唤醒（睡眠/休眠电脑用，比 USB 远程唤醒更可靠）----
- * 填你笔记本无线网卡的 MAC（去冒号小写）——ipconfig /all 查"物理地址"
- * 例：A1-B2-C3-D4-E5-F6 → "a1b2c3d4e5f6"
+#if ENABLE_WOL
+/* ---- WOL 目标配置（ENABLE_WOL=1 时才需要填）----
+ * PC_MAC：目标机网卡的 MAC（去冒号/横杠、小写、正好 12 位）
+ *   ⚠️ 有线网卡和无线网卡是【两个不同的 MAC】。填错 = 魔法包发给了另一张卡，
+ *      必然失败，而且不会有任何报错 —— 这是 WOL 最常见的坑。
+ *      ipconfig /all 里分别看：「以太网适配器」=有线 /「无线局域网适配器」=无线
+ * PC_MAC2：第二张网卡的 MAC（留空 "" 则跳过）
+ * PC_IP  ：可选。填了会额外发「定向单播」包 —— 部分交换机/AP 抑制广播但放行
+ *      单播，这时只有定向包能到。留空则只发广播。
  */
 #if __has_include("secrets.h")
-const char* PC_MAC = SECRET_PC_MAC;
+const char* PC_MAC  = SECRET_PC_MAC;
+const char* PC_MAC2 = SECRET_PC_MAC2;
+const char* PC_IP   = SECRET_PC_IP;
 #else
-const char* PC_MAC = "aabbccddeeff";  // ← 笔记本网卡 MAC（去冒号小写）
+const char* PC_MAC  = "aabbccddeeff";  // ← 主目标网卡 MAC（有线优先）
+const char* PC_MAC2 = "";              // ← 备用网卡 MAC，留空则不发
+const char* PC_IP   = "";              // ← 可选：目标机 IP（额外发定向单播）
+#endif
 #endif
 
 /* ================= 2. 舵机微调 ================= */
-const int ACT_PIN = 4;               // 舵机信号线（橙线）
+const int ACT_PIN = 14;  // 舵机信号线（橙线）——左排针底部，与 5Vin/GND 相邻
+/* ⚠️ 左排针底部三针自上而下：14 → 5Vin → GND，正好对上舵机 橙→红→棕。
+ *    插错一位 = 信号脚吃到 5V，或电源/地反接 → 烧舵机。插前逐根核对丝印！
+ *    想换回板子顶部的 GPIO4，把上面那行改成 4 即可（其余代码无需改动）。
+ */
 const uint32_t PRESS_HOLD_MS = 600;  // 按住时长，电源键短按即可
 
 const int SERVO_IDLE_DEG = 10;   // 待机角度（离开电源键）
@@ -138,30 +164,69 @@ PubSubClient mqtt(mqttTcp);
 uint32_t mqttRetryAt = 0;  // MQTT 断线重连计时
 uint32_t lastWifiCheck = 0;  // WiFi 掉线检查计时（校园网会定时踢人）
 #endif
+#if ENABLE_WOL
 WiFiUDP wolUdp;  // WOL 魔术包广播用（纯网络，与 USB 栈无关）
+#endif
 
-/* ---------- WOL 网络唤醒：广播魔术包唤醒睡眠/休眠中的笔记本 ----------
- * 纯 UDP 广播，不依赖任何 USB 协议；目标网卡设置"只允许幻数据包唤醒"即可。
+/* ---------- WOL 网络唤醒：魔术包唤醒睡眠中的笔记本 ----------
+ * 纯 UDP，不依赖任何 USB 协议；目标网卡设「只允许幻数据包唤醒」即可。
+ * 一次调用 = 多目的地 × 多端口 × 多轮，尽量提高命中率：
+ *   ① 全局广播 255.255.255.255   ② 本子网广播（由 ESP 的 IP+掩码算出）
+ *   ③ 定向单播（只有填了 PC_IP 才发）
+ * 并打印 ESP 自己的 IP / 掩码 / 广播地址——若与笔记本不在同一网段，一眼可见。
  */
+#if ENABLE_WOL
 void sendWol() {
-  uint8_t mac[6], pkt[102];
-  for (int i = 0; i < 6; i++) {
-    char b[3] = { PC_MAC[2 * i], PC_MAC[2 * i + 1], 0 };
-    mac[i] = (uint8_t)strtol(b, nullptr, 16);
+  /* ---- 目的地清单先算好：全局广播 + 本子网广播 +（可选）定向单播 ---- */
+  IPAddress dst[3];
+  int nDst = 0;
+  dst[nDst++] = IPAddress(255, 255, 255, 255);
+  IPAddress myIp = WiFi.localIP(), myMask = WiFi.subnetMask();
+  IPAddress subnetBc;
+  for (int i = 0; i < 4; i++)
+    subnetBc[i] = (myIp[i] & myMask[i]) | (uint8_t)(~myMask[i]);
+  dst[nDst++] = subnetBc;
+  IPAddress pcIp;
+  if (strlen(PC_IP) > 0 && pcIp.fromString(PC_IP)) dst[nDst++] = pcIp;
+  const uint16_t ports[] = { 9, 7 };
+
+  /* ---- 对「有线 + 无线」两张网卡各发一轮 ---- */
+  const char* macs[2] = { PC_MAC, PC_MAC2 };
+  const char* tags[2] = { "有线", "无线" };
+  for (int m = 0; m < 2; m++) {
+    if (strlen(macs[m]) != 12) continue;   // 留空或长度不对 → 跳过这张卡
+    uint8_t mac[6], pkt[102];
+    for (int i = 0; i < 6; i++) {
+      char b[3] = { macs[m][2 * i], macs[m][2 * i + 1], 0 };
+      mac[i] = (uint8_t)strtol(b, nullptr, 16);
 
 
     
   }
   memset(pkt, 0xFF, 6);
   for (int i = 0; i < 16; i++) memcpy(pkt + 6 + i * 6, mac, 6);
-  const uint16_t ports[] = { 9, 7, 0 };
-  for (uint16_t p : ports) {
-    wolUdp.beginPacket(IPAddress(255, 255, 255, 255), p);
-    wolUdp.write(pkt, sizeof(pkt));
-    wolUdp.endPacket();
+  /* ---- 端口 9 / 7 是 WOL 标准端口；连发 3 轮，睡眠网卡容易漏包 ---- */
+  for (int round = 0; round < 3; round++) {
+    for (int d = 0; d < nDst; d++) {
+      for (uint16_t p : ports) {
+        wolUdp.beginPacket(dst[d], p);
+        wolUdp.write(pkt, sizeof(pkt));
+        wolUdp.endPacket();
+      }
+    }
+    delay(120);
   }
-  Serial.println("[WOL] 魔术包已广播（唤醒睡眠中的笔记本）");
+  Serial.printf("[WOL] %s网卡 %s 已发（%d 个目的地 x 3 轮）\n",
+                tags[m], macs[m], nDst);
+  }   /* 结束「遍历两张网卡」的循环 */
+
+  Serial.printf("[WOL] ESP 侧: IP=%s 掩码=%s 子网广播=%s\n",
+                myIp.toString().c_str(), myMask.toString().c_str(),
+                subnetBc.toString().c_str());
+  if (nDst > 2) Serial.printf("[WOL] 另发定向单播 → %s\n", PC_IP);
+  Serial.println("[WOL] 没醒？先比对上面 ESP 网段与笔记本是否一致");
 }
+#endif  // ENABLE_WOL
 
 uint32_t loginAt = 0;    // 到点执行登录的时刻；0 = 无任务
 bool bootLogin = false;  // 是否处于"开机后自动登录"流程中
@@ -208,7 +273,7 @@ void pressPower() {
 
 #if USE_CLOUD
 /* ---------- 校园网 MQTT 连通性诊断 ----------
- * 实测结论（2026-09-27）：校园网深澜 Portal **只劫持 HTTP 80 端口**，
+ * 实测结论（2026-09-27）：校园网的深澜 Portal **只劫持 HTTP 80 端口**，
  * 巴法云 MQTT 用的 9501 端口不受影响 —— 所以 ESP 连上开放 WiFi
  * 后无需任何认证即可直接用 MQTT。
  *
@@ -261,8 +326,10 @@ void typeString(const char* s) {
  * '\n' = 回车，0x1B = ESC
  */
 void doLogin() {
+#if ENABLE_WOL
   sendWol();                    // 若笔记本在睡眠，先通过网卡魔术包唤醒它
   delay(3000);                  // 等笔记本被唤醒（1~3 秒）
+#endif
 
 #if LOGIN_SEND_PREAMBLE
   Keyboard.releaseAll();
@@ -296,7 +363,7 @@ void doLogin1() {
 
 /* ---------- 打字自检（dry-run）：把 PIN 当成普通文本打出去 ----------
  * 用途：在**记事本 / 任意输入框**里验证 ESP 到底发出了什么字符。
- *   - 若记事本里得到干净的 PIN（6 个字符）→ ESP 侧没问题，多出的字符是
+ *   - 若记事本里得到干净的 "123456" → ESP 侧没问题，多出的字符是
  *     主机侧的（浏览器搜索框联想补全 / 输入法 / 焦点）；
  *   - 若记事本里也有多余字符 → 问题在发送端，再回头查固件/主机轮询。
  * 只读配置，不改任何状态，安全。
@@ -401,11 +468,30 @@ void mqttConnect() {
 
 void setup() {
   Serial.begin(115200);
+  delay(800);        // 等 USB 虚拟串口枚举完，防止开头几行日志丢失
   Keyboard.begin();  // 枚举为 USB HID 键盘
+
+  /* ---- 开机自报家门：一眼确认烧进去的是哪版、舵机接的是哪个引脚 ---- */
+  Serial.println();
+  Serial.println("===== WiFi PIN 登录器 v5.4 =====");
+  Serial.printf("[Cfg] 舵机信号脚 ACT_PIN = %d  →  GPIO%d\n", ACT_PIN, ACT_PIN);
+#if ENABLE_WOL
+  Serial.printf("[Cfg] WOL 有线 MAC = %s\n",
+                strlen(PC_MAC) == 12 ? PC_MAC : "⚠️ 长度不对，必须 12 位！");
+  Serial.printf("[Cfg] WOL 无线 MAC = %s\n",
+                strlen(PC_MAC2) == 12 ? PC_MAC2 : "(未启用)");
+#else
+  Serial.println("[Cfg] WOL 已关闭（ENABLE_WOL=0）—— 本项目用「锁屏代替睡眠」");
+#endif
+  Serial.printf("[Cfg] 待机 %d° / 按压 %d° / 按住 %u ms\n",
+                SERVO_IDLE_DEG, SERVO_PRESS_DEG, (unsigned)PRESS_HOLD_MS);
+  Serial.printf("[Cfg] WiFi = %s\n", WIFI_SSID);
 
   powerServo.setPeriodHertz(50);  // SG90 标准 50Hz
   powerServo.attach(ACT_PIN, 500, 2500);
   powerServo.write(SERVO_IDLE_DEG);  // 上电回待机位，别一直压着电源键
+  Serial.printf("[Servo] 已初始化，归位到 %d°（信号脚 GPIO%d）\n",
+                SERVO_IDLE_DEG, ACT_PIN);
 
   WiFi.mode(WIFI_STA);
   if (strlen(WIFI_PASS) > 0) {
@@ -422,7 +508,9 @@ void setup() {
 #if USE_CLOUD
   diagnoseNetwork();  // 诊断 MQTT 端口可达性（不阻塞）
 #endif
+#if ENABLE_WOL
   wolUdp.begin(9);  // WiFi 就绪后再初始化 UDP（WOL 广播用）
+#endif
 
   server.on("/", HTTP_GET, []() {
     server.send_P(200, "text/html", PAGE);
